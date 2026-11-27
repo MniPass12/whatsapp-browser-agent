@@ -72,14 +72,16 @@ jobs:
             sleep 1
           done
 
-      - name: Install Patchright stealth Chrome and Xvfb
+      - name: Install Patchright Chromium, Xvfb, and browser extensions
         timeout-minutes: 4
         run: |
           if [ ! -d runner/node_modules/patchright ]; then
             npm install --prefix runner --no-audit --no-fund
           fi
-          npx --prefix runner patchright install chrome --with-deps || npx --prefix runner patchright install chromium --with-deps
+          npx --prefix runner patchright install chromium --with-deps
           which xvfb-run >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y xvfb)
+          which unzip >/dev/null 2>&1 || sudo apt-get install -y unzip
+          node runner/setup-extensions.mjs
 
       - name: Run persistent browser session
         env:
