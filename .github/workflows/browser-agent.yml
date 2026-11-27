@@ -1,0 +1,91 @@
+name: Interactive Browser Agent Runner
+
+on:
+  repository_dispatch:
+    types: [browser_session]
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: Optional test mode (e.g. smoke)
+        required: false
+        default: ""
+      test_url:
+        description: Optional URL for smoke test
+        required: false
+        default: "https://example.com"
+
+jobs:
+  browser-session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Cache runner npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: runner/node_modules
+          key: ${{ runner.os }}-runner-node-${{ hashFiles('runner/package.json') }}
+
+      - name: Start ephemeral Cloudflare WARP SOCKS5 proxy
+        timeout-minutes: 1
+        continue-on-error: true
+        run: |
+          mkdir -p /tmp/warp
+          cd /tmp/warp
+
+          WGCF_URL="https://github.com/ViRb3/wgcf/releases/download/v2.2.25/wgcf_2.2.25_linux_amd64"
+          WP_URL="https://github.com/pufferffish/wireproxy/releases/download/v1.0.9/wireproxy_linux_amd64.tar.gz"
+
+          curl -fsSL --connect-timeout 4 --max-time 12 "$WGCF_URL" -o wgcf || exit 0
+          chmod +x wgcf
+
+          curl -fsSL --connect-timeout 4 --max-time 12 "$WP_URL" -o wireproxy.tar.gz || exit 0
+          tar -xzf wireproxy.tar.gz || exit 0
+          chmod +x wireproxy
+
+          timeout 12s ./wgcf register --accept-tos </dev/null >/tmp/wgcf.log 2>&1 || exit 0
+          timeout 8s ./wgcf generate </dev/null >>/tmp/wgcf.log 2>&1 || exit 0
+
+          cat > /tmp/warp/wireproxy.conf << 'EOF'
+          WGConfig = /tmp/warp/wgcf-profile.conf
+
+          [Socks5]
+          BindAddress = 127.0.0.1:40000
+          EOF
+
+          ./wireproxy -c /tmp/warp/wireproxy.conf </dev/null >/tmp/wireproxy.log 2>&1 &
+
+          for i in $(seq 1 8); do
+            if curl -sf --connect-timeout 2 --max-time 4 --socks5-hostname 127.0.0.1:40000 https://www.cloudflare.com/cdn-cgi/trace | grep -q "warp=on"; then
+              echo "WARP SOCKS5 proxy active on 127.0.0.1:40000"
+              touch /tmp/warp_ready
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Install Patchright stealth Chrome and Xvfb
+        timeout-minutes: 4
+        run: |
+          if [ ! -d runner/node_modules/patchright ]; then
+            npm install --prefix runner --no-audit --no-fund
+          fi
+          npx --prefix runner patchright install chrome --with-deps || npx --prefix runner patchright install chromium --with-deps
+          which xvfb-run >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y xvfb)
+
+      - name: Run persistent browser session
+        env:
+          INTERNAL_CALLBACK_SECRET: ${{ secrets.INTERNAL_CALLBACK_SECRET }}
+          WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
+          DISPATCH_SESSION_ID: ${{ github.event.client_payload.session_id }}
+          WORKFLOW_INPUT_TEST: ${{ inputs.test_mode }}
+          WORKFLOW_INPUT_URL: ${{ inputs.test_url }}
+        run: xvfb-run -a -s "-screen 0 1280x900x24" node runner/browser-session.mjs
