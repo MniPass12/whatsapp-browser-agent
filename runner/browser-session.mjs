@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { chromium } from 'patchright';
+import { ensureExtensions } from './setup-extensions.mjs';
 
 const SOM_EVALUATE_FN = `(() => {
   const existing = document.getElementById('__som_overlay_root');
@@ -61,6 +62,7 @@ const SOM_EVALUATE_FN = `(() => {
 
   for (const el of rawNodes) {
     if (items.length >= 65) break;
+    if (el.closest('[class*="vimium"], #vimiumHintMarkerContainer, .vimiumReset')) continue;
     const rect = el.getBoundingClientRect();
     if (!isVisible(el, rect)) continue;
 
@@ -296,34 +298,163 @@ async function captureAnnotatedState(page, seenSet) {
   };
 }
 
-async function launchBrowser(useWarp) {
-  const hasDisplay = Boolean(process.env.DISPLAY);
-  const baseLaunch = {
-    headless: !hasDisplay,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-  };
-  if (useWarp) {
-    baseLaunch.proxy = { server: 'socks5://127.0.0.1:40000' };
-  }
-
-  let browser;
+async function closeBrowserSession(session) {
+  if (!session) return;
   try {
-    browser = await chromium.launch({
-      ...baseLaunch,
-      channel: 'chrome',
-    });
-  } catch (err) {
-    console.warn('Chrome channel unavailable, falling back to Patchright chromium:', err.message);
-    browser = await chromium.launch(baseLaunch);
+    await session.context?.close().catch(() => {});
+  } catch {
+    // Ignore close error
+  }
+  try {
+    await session.browser?.close().catch(() => {});
+  } catch {
+    // Ignore close error
+  }
+  if (session.userDataDir) {
+    fs.rmSync(session.userDataDir, { recursive: true, force: true });
+  }
+}
+
+async function launchBrowser(useWarp, extensionDirs = []) {
+  const hasDisplay = Boolean(process.env.DISPLAY);
+  const hasExtensions = Array.isArray(extensionDirs) && extensionDirs.length > 0;
+  const userDataDir = `/tmp/wa-chrome-profile-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  fs.mkdirSync(userDataDir, { recursive: true });
+
+  const args = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-gpu',
+    '--no-first-run',
+    '--no-default-browser-check',
+  ];
+
+  if (hasExtensions) {
+    const extList = extensionDirs.join(',');
+    args.push(`--disable-extensions-except=${extList}`, `--load-extension=${extList}`);
+    if (!hasDisplay) {
+      args.push('--headless=new');
+    }
   }
 
-  const context = await browser.newContext({
+  const contextOpts = {
+    headless: hasExtensions && !hasDisplay ? false : !hasDisplay,
     viewport: { width: 1280, height: 840 },
     locale: 'en-US',
     acceptDownloads: true,
-  });
-  const page = await context.newPage();
-  return { browser, context, page };
+    args,
+  };
+  if (useWarp) {
+    contextOpts.proxy = { server: 'socks5://127.0.0.1:40000' };
+  }
+
+  // Branded Google Chrome blocks --load-extension; always use Chromium when extensions are loaded
+  let context;
+  let browser = null;
+  if (hasExtensions) {
+    try {
+      context = await chromium.launchPersistentContext(userDataDir, contextOpts);
+    } catch (extErr) {
+      console.warn('Persistent context launch with extensions failed, retrying without extensions:', extErr.message);
+      const cleanArgs = args.filter(
+        (a) => !a.startsWith('--disable-extensions-except=') && !a.startsWith('--load-extension=')
+      );
+      context = await chromium.launchPersistentContext(userDataDir, {
+        ...contextOpts,
+        headless: !hasDisplay,
+        args: cleanArgs,
+      });
+    }
+  } else {
+    const baseLaunch = {
+      headless: !hasDisplay,
+      args,
+      ...(useWarp ? { proxy: { server: 'socks5://127.0.0.1:40000' } } : {}),
+    };
+    try {
+      browser = await chromium.launch({ ...baseLaunch, channel: 'chrome' });
+    } catch (err) {
+      console.warn('Chrome channel unavailable, falling back to Patchright chromium:', err.message);
+      browser = await chromium.launch(baseLaunch);
+    }
+    context = await browser.newContext({
+      viewport: { width: 1280, height: 840 },
+      locale: 'en-US',
+      acceptDownloads: true,
+    });
+  }
+
+  // Wait briefly for MV3 extension service workers / onboarding pages, then close extension tabs
+  if (hasExtensions) {
+    await sleep(700);
+    for (const existingPage of context.pages()) {
+      if (existingPage.url().startsWith('chrome-extension://')) {
+        await existingPage.close().catch(() => {});
+      }
+    }
+  }
+
+  const page = context.pages().find((p) => !p.url().startsWith('chrome-extension://')) || (await context.newPage());
+  console.log(`Browser launched (warp=${useWarp}, extensions=${hasExtensions ? extensionDirs.map((d) => path.basename(d)).join('+') : 'none'})`);
+  return { browser, context, page, userDataDir };
+}
+
+const PLAYWRIGHT_NAMED_KEYS = new Set([
+  'Enter',
+  'Escape',
+  'Tab',
+  'Backspace',
+  'Delete',
+  'Space',
+  ' ',
+  'ArrowUp',
+  'ArrowDown',
+  'ArrowLeft',
+  'ArrowRight',
+  'Home',
+  'End',
+  'PageUp',
+  'PageDown',
+  'Insert',
+  'F1',
+  'F2',
+  'F3',
+  'F4',
+  'F5',
+  'F6',
+  'F7',
+  'F8',
+  'F9',
+  'F10',
+  'F11',
+  'F12',
+]);
+
+async function executeKeySequence(page, rawKeys) {
+  const tokens = String(rawKeys || 'Enter')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (tokens.length === 0) tokens.push('Enter');
+
+  for (const token of tokens) {
+    if (PLAYWRIGHT_NAMED_KEYS.has(token) || token.includes('+') || token.length === 1) {
+      await page.keyboard.press(token);
+      await sleep(90);
+    } else {
+      // Multi-char Vimium key sequence like "gg", "gi", "yy", or hint code "ab"
+      for (const ch of token) {
+        await page.keyboard.press(ch);
+        await sleep(60);
+      }
+    }
+  }
+
+  const last = tokens[tokens.length - 1];
+  if (last === 'f' || last === 'F' || last === '?') {
+    await sleep(250);
+  }
 }
 
 async function selectOptionRobust(locator, targetValue) {
@@ -358,27 +489,30 @@ async function selectOptionRobust(locator, targetValue) {
 
 async function main() {
   const warpReady = fs.existsSync('/tmp/warp_ready');
-  console.log(`WARP SOCKS5 ready: ${warpReady}, DISPLAY: ${process.env.DISPLAY || 'none'}`);
+  const extensionDirs = await ensureExtensions();
+  console.log(
+    `WARP SOCKS5 ready: ${warpReady}, DISPLAY: ${process.env.DISPLAY || 'none'}, Extensions: ${extensionDirs.length}`
+  );
 
   if (TEST_MODE === 'smoke') {
     let usingWarp = warpReady;
-    let { browser, page } = await launchBrowser(usingWarp);
+    let session = await launchBrowser(usingWarp, extensionDirs);
+    let { page } = session;
     await page.goto(TEST_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await sleep(1000);
     let blockState = await waitForChallengeClear(page);
-    let title = await page.title();
     console.log(`Smoke check (warp=${usingWarp}) state=${blockState}`);
     if (blockState === 'blocked' && warpReady) {
-      await browser.close().catch(() => {});
+      await closeBrowserSession(session);
       usingWarp = !usingWarp;
-      ({ browser, page } = await launchBrowser(usingWarp));
+      session = await launchBrowser(usingWarp, extensionDirs);
+      ({ page } = session);
       await page.goto(TEST_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
       await sleep(1000);
       blockState = await waitForChallengeClear(page);
-      title = await page.title();
       console.log(`Smoke retry (warp=${usingWarp}) state=${blockState}`);
     }
-    await browser.close();
+    await closeBrowserSession(session);
     return;
   }
 
@@ -414,7 +548,8 @@ async function main() {
   }
 
   let usingWarp = warpReady;
-  let { browser, context, page } = await launchBrowser(usingWarp);
+  let browserSession = await launchBrowser(usingWarp, extensionDirs);
+  let { context, page } = browserSession;
   let pages = [page];
   let activeTabIndex = 0;
 
@@ -477,10 +612,14 @@ async function main() {
 
   const attachPopupHandler = (ctx) => {
     ctx.on('page', async (newPage) => {
+      await newPage.waitForLoadState('domcontentloaded', { timeout: 6000 }).catch(() => {});
+      if (newPage.url().startsWith('chrome-extension://')) {
+        await newPage.close().catch(() => {});
+        return;
+      }
       trackPage(newPage);
       activeTabIndex = pages.indexOf(newPage);
       page = newPage;
-      await newPage.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
     });
   };
   trackPage(page);
@@ -516,9 +655,10 @@ async function main() {
 
     const failedUrl = snap.currentUrl || page.url();
     console.warn(`Detected block (warp=${usingWarp}), toggling transport...`);
-    await browser.close().catch(() => {});
+    await closeBrowserSession(browserSession);
     usingWarp = !usingWarp;
-    ({ browser, context, page } = await launchBrowser(usingWarp));
+    browserSession = await launchBrowser(usingWarp, extensionDirs);
+    ({ context, page } = browserSession);
     pages = [page];
     activeTabIndex = 0;
     trackPage(page);
@@ -576,7 +716,7 @@ async function main() {
 
     if (type === 'press_key') {
       const key = String(p.text ?? 'Enter').trim() || 'Enter';
-      await page.keyboard.press(key);
+      await executeKeySequence(page, key);
       return;
     }
 
@@ -728,9 +868,10 @@ async function main() {
     } catch (navErr) {
       if (usingWarp) {
         console.warn('WARP navigation failed, retrying direct');
-        await browser.close().catch(() => {});
+        await closeBrowserSession(browserSession);
         usingWarp = false;
-        ({ browser, context, page } = await launchBrowser(false));
+        browserSession = await launchBrowser(false, extensionDirs);
+        ({ context, page } = browserSession);
         pages = [page];
         activeTabIndex = 0;
         trackPage(page);
@@ -891,7 +1032,7 @@ async function main() {
     }
     throw fatalErr;
   } finally {
-    await browser.close().catch(() => {});
+    await closeBrowserSession(browserSession);
   }
 }
 
