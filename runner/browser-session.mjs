@@ -61,7 +61,7 @@ const SOM_EVALUATE_FN = `(() => {
   }
 
   for (const el of rawNodes) {
-    if (items.length >= 65) break;
+    if (items.length >= 85) break;
     if (el.closest('[class*="vimium"], #vimiumHintMarkerContainer, .vimiumReset')) continue;
     const rect = el.getBoundingClientRect();
     if (!isVisible(el, rect)) continue;
@@ -167,13 +167,16 @@ const SOM_EVALUATE_FN = `(() => {
 
   document.documentElement.appendChild(root);
 
-  const rawBody = (document.body?.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 1500);
+  const rawBody = (document.body?.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 1450);
+  const maxScroll = Math.max(0, (document.documentElement?.scrollHeight || document.body?.scrollHeight || vh) - vh);
+  const scrollPct = maxScroll > 0 ? Math.round((window.scrollY / maxScroll) * 100) : 0;
+  const scrollLine = '\\nViewport Scroll: ' + scrollPct + '% (y=' + Math.round(window.scrollY) + '/' + Math.round(maxScroll) + ')';
   const inputLine = inputSnapshots.length ? ('\\nActive Input Values: ' + inputSnapshots.join(' | ')) : '';
   return {
     elements: items,
     pageTitle: document.title || '',
     currentUrl: location.href,
-    pageTextSummary: (rawBody + inputLine).slice(0, 1900)
+    pageTextSummary: (rawBody + scrollLine + inputLine).slice(0, 1950)
   };
 })()`;
 
@@ -612,7 +615,6 @@ async function main() {
 
   const attachPopupHandler = (ctx) => {
     ctx.on('page', async (newPage) => {
-      await newPage.waitForLoadState('domcontentloaded', { timeout: 6000 }).catch(() => {});
       if (newPage.url().startsWith('chrome-extension://')) {
         await newPage.close().catch(() => {});
         return;
@@ -620,6 +622,11 @@ async function main() {
       trackPage(newPage);
       activeTabIndex = pages.indexOf(newPage);
       page = newPage;
+      await newPage.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {});
+      if (newPage.url().startsWith('chrome-extension://')) {
+        await newPage.close().catch(() => {});
+        pruneClosedPages();
+      }
     });
   };
   trackPage(page);
@@ -673,6 +680,7 @@ async function main() {
       const locator = page.locator(`[data-som-id="${id}"]`).first();
       const count = await locator.count();
       if (count > 0) {
+        await locator.evaluate((el) => el.scrollIntoView({ block: 'center', inline: 'nearest' })).catch(() => {});
         await locator.scrollIntoViewIfNeeded().catch(() => {});
         try {
           await locator.click({ timeout: 6000 });
